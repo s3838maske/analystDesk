@@ -1,0 +1,252 @@
+// AnalystDesk pilot schema. SQLite for the pilot; switch provider to postgresql later.
+// Money and ratio values are stored as decimal strings and handled with decimal.js (no JS floats).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Roles: ANALYST, REVIEWER, ADMIN, COMPLIANCE (ADM-03)
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  role         String
+  passwordHash String
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  sessions     Session[]
+  analysesOwned    Analysis[] @relation("owner")
+  analysesReviewed Analysis[] @relation("reviewer")
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+/// Pilot company universe (20–30 listed companies)
+model Company {
+  id     String @id @default(cuid())
+  name   String
+  nse    String @unique
+  bse    String?
+  sector String
+  analyses Analysis[]
+}
+
+model PeerSetTemplate {
+  id         String   @id @default(cuid())
+  name       String
+  sector     String?
+  companyIds String   // JSON array of company ids
+  createdAt  DateTime @default(now())
+}
+
+/// Status: DRAFT, IN_REVIEW, CHANGES_REQUESTED, APPROVED
+/// Stage (where the analyst is): SETUP, DATA, VALIDATION, RATIOS, MODEL, REPORT
+model Analysis {
+  id           String   @id @default(cuid())
+  companyId    String
+  company      Company  @relation(fields: [companyId], references: [id])
+  peerIds      String   // JSON array of company ids
+  fyFrom       Int      // first fiscal year, e.g. 2021 means FY21
+  fyTo         Int
+  quarters     String   // JSON array of quarter labels, e.g. ["Q1FY26",...]
+  purpose      String?
+  ownerId      String
+  owner        User     @relation("owner", fields: [ownerId], references: [id])
+  reviewerId   String
+  reviewer     User     @relation("reviewer", fields: [reviewerId], references: [id])
+  status       String   @default("DRAFT")
+  /// JSON array of areas reopened by change requests: DATA, ASSUMPTIONS, WORDING. Empty = all open (draft).
+  reopened     String   @default("[]")
+  approvedById String?
+  approvedAt   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  uploads      UploadedFile[]
+  values       FinancialValue[]
+  flags        Flag[]
+  assumptions  Assumption[]
+  modelRuns    ModelRun[]
+  report       Report?
+  versions     ReportVersion[]
+  changeRequests ChangeRequest[]
+  timeEntries  TimeEntry[]
+}
+
+/// ING-04: raw file kept unchanged on disk; this row records who/when/what.
+model UploadedFile {
+  id          String   @id @default(cuid())
+  analysisId  String
+  analysis    Analysis @relation(fields: [analysisId], references: [id])
+  fileName    String
+  storedPath  String
+  sha256      String
+  sizeBytes   Int
+  sourceLabel String   // e.g. "Annual report FY25", "terminal export"
+  kind        String   // FINANCIALS, PRICES
+  uploadedBy  String
+  uploadedAt  DateTime @default(now())
+  status      String   @default("PENDING_MAPPING") // PENDING_MAPPING, IMPORTED
+  values      FinancialValue[]
+}
+
+/// ING-03: saved column mapping per source label
+model ColumnMapping {
+  id          String   @id @default(cuid())
+  sourceLabel String   @unique
+  layout      String   // LONG or WIDE
+  config      String   // JSON
+  version     Int      @default(1)
+  updatedAt   DateTime @updatedAt
+}
+
+/// One stored value (base units, INR). Raw values are never changed: corrections create a new row
+/// with origin OVERRIDDEN/ANALYST and `supersedesId`, and the old row gets `active=false` only via a new row.
+model FinancialValue {
+  id             String   @id @default(cuid())
+  analysisId     String
+  analysis       Analysis @relation(fields: [analysisId], references: [id])
+  companyId      String
+  period         String   // FY2025 or Q1FY26
+  lineItem       String   // standard chart of accounts key
+  value          String   // decimal string, base units (INR / shares / INR per share)
+  rawValue       String   // as it appeared in the file
+  rawUnit        String   // crore, lakh, million, units
+  rawLabel       String   // source line-item label
+  fileId         String?
+  file           UploadedFile? @relation(fields: [fileId], references: [id])
+  sourceRef      String?  // sheet!cell
+  mappingVersion String
+  origin         String   // AUTOMATED, OVERRIDDEN, ANALYST
+  reason         String?
+  supersedesId   String?
+  active         Boolean  @default(true)
+  createdBy      String
+  createdAt      DateTime @default(now())
+
+  @@index([analysisId, companyId, period, lineItem])
+}
+
+/// VAL-04..07
+model Flag {
+  id          String   @id @default(cuid())
+  analysisId  String
+  analysis    Analysis @relation(fields: [analysisId], references: [id])
+  companyId   String
+  period      String?
+  signature   String   // stable id of the issue, so accepted flags are not re-raised
+  type        String   // BS_IMBALANCE, CF_TIE, MISSING_PERIOD, RESTATEMENT, SIGN, OUTLIER, MISSING_ITEM
+  severity    String   // HIGH, MEDIUM, LOW
+  message     String
+  affected    String   // JSON: [{lineItem, period, value, valueId}]
+  status      String   @default("OPEN") // OPEN, ACCEPTED, CORRECTED, OVERRIDDEN
+  resolution  String?
+  resolvedBy  String?
+  resolvedAt  DateTime?
+  createdAt   DateTime @default(now())
+}
+
+/// MOD-01/02
+model Assumption {
+  id          String   @id @default(cuid())
+  analysisId  String
+  analysis    Analysis @relation(fields: [analysisId], references: [id])
+  key         String
+  value       String
+  defaultValue String
+  basis       String   // how the default was derived
+  origin      String   // AUTOMATED (default), ANALYST
+  confirmed   Boolean  @default(false)
+  updatedBy   String?
+  updatedAt   DateTime @updatedAt
+
+  @@unique([analysisId, key])
+}
+
+/// MOD-03..05 output, reproducible from inputs + formulaVersion (NFR-02)
+model ModelRun {
+  id             String   @id @default(cuid())
+  analysisId     String
+  analysis       Analysis @relation(fields: [analysisId], references: [id])
+  formulaVersion String
+  inputs         String   // JSON snapshot of every input used
+  outputs        String   // JSON
+  createdBy      String
+  createdAt      DateTime @default(now())
+}
+
+/// REP-01..03: live draft. Section text holds {{tokens}} linked to the latest model run.
+model Report {
+  id         String   @id @default(cuid())
+  analysisId String   @unique
+  analysis   Analysis @relation(fields: [analysisId], references: [id])
+  sections   String   // JSON [{key,title,body,editable,autoDrafted}]
+  updatedAt  DateTime @updatedAt
+}
+
+/// REV-06/07: frozen snapshot per submission
+model ReportVersion {
+  id          String   @id @default(cuid())
+  analysisId  String
+  analysis    Analysis @relation(fields: [analysisId], references: [id])
+  number      Int
+  sections    String   // JSON rendered sections (tokens resolved)
+  values      String   // JSON map of every linked value at submission
+  modelRunId  String?
+  submittedBy String
+  submittedAt DateTime @default(now())
+}
+
+/// REV-02..05
+model ChangeRequest {
+  id          String   @id @default(cuid())
+  analysisId  String
+  analysis    Analysis @relation(fields: [analysisId], references: [id])
+  versionNo   Int
+  type        String   // DATA, ASSUMPTION, WORDING
+  comment     String
+  anchor      String   // e.g. value:dcf.perShare, section:overview, assumption:wacc
+  status      String   @default("OPEN") // OPEN, ADDRESSED
+  createdBy   String
+  createdAt   DateTime @default(now())
+  addressedAt DateTime?
+}
+
+/// AUD-02/03: append-only. UPDATE/DELETE blocked by SQLite triggers (see prisma/triggers.sql).
+model AuditLog {
+  id         String   @id @default(cuid())
+  analysisId String?
+  userId     String
+  userName   String
+  action     String
+  entity     String
+  entityId   String?
+  detail     String   // JSON
+  at         DateTime @default(now())
+
+  @@index([analysisId])
+}
+
+/// ADM-01
+model TimeEntry {
+  id         String   @id @default(cuid())
+  analysisId String
+  analysis   Analysis @relation(fields: [analysisId], references: [id])
+  userId     String
+  stage      String
+  seconds    Int
+  day        String   // YYYY-MM-DD
+  updatedAt  DateTime @updatedAt
+
+  @@unique([analysisId, userId, stage, day])
+}
